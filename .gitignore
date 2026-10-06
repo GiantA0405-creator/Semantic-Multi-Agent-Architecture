@@ -1,4 +1,21 @@
+# PyTorch 및 대용량 AI 가중치 제외
 *.pt
 *.pth
+*.onnx
+*.engine
+
+# NumPy 대용량 데이터 바이너리 (필요시 제외, 필요하면 주석 해제)
+# *.npy
+
+# Python 캐시 및 임시 파일
 __pycache__/
+*.py[cod]
+
+# 백업 및 테스트용 임시 파일 제외
+*deleted_marked*
+juneho/
+
+# 가상환경 및 환경 변수
+.venv/
+venv/
 .env
