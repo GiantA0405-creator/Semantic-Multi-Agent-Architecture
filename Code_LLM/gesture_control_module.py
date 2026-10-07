@@ -36,7 +36,8 @@ X_MIN, X_MAX = 300.0, 700.0
 Y_MIN, Y_MAX = -400.0, 400.0
 Z_MIN, Z_MAX = 50.0, 700.0
 
-YOLO_WEIGHTS_PATH = "/home/rokey/Downloads/CodeLLM/resource/towel_yolo26n_seg_v5_best.pt" 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+YOLO_WEIGHTS_PATH = os.path.join(BASE_DIR, "source", "towel_yolo26n_seg_v5_best.pt")
 HOME_JOINT = [0, 0, 90, -90, 90, 0]
 
 # 🗜️ 그리퍼 세팅 (IP와 포트는 상황에 맞게 유지)

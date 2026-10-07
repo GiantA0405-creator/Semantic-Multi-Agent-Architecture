@@ -11,12 +11,12 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from concurrent.futures import ProcessPoolExecutor
 
-import integrated_scan_module
+import integrated_scan_module as integrated_scan_module # 💡 1번에서 만든 스캔 모듈 임포트
 
 import gesture_control_module # 💡 1번에서 만든 제스처 모듈 임포트
 # ============================================================
 # 1. 기본 설정 및 경량 시스템 프롬프트 (qwen_coder 로직 완벽 유지)
-# ============================================================
+# ============================================================ 
 MODEL_NAME = "qwen2.5-coder:7b"
 
 SAVE_DIR = os.path.expanduser("~/cobot_generated")

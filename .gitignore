@@ -19,3 +19,6 @@ juneho/
 .venv/
 venv/
 .env
+
+# Firebase 및 Cloud Service Account 키 제외
+*.json

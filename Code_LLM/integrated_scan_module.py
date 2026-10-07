@@ -14,8 +14,10 @@ from scipy.spatial.transform import Rotation
 ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m0609"
 
-MODEL_PATH = "/home/rokey/Downloads/CodeLLM/resource/towel_yolo26n_seg_v5_best.pt"
-NPY_PATH = "/home/rokey/Downloads/CodeLLM/resource/T_gripper2camera.npy"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "source", "towel_yolo26n_seg_v5_best.pt")
+NPY_PATH = os.path.join(BASE_DIR, "source", "T_gripper2camera.npy")
 
 SCAN_SECONDS = 10.0
 YOLO_CONF = 0.4
@@ -24,10 +26,10 @@ MIN_DETECTIONS = 50
 DIST_THRESHOLD = 30.0
 
 # 💡 Z축 오프셋 높이 설정 (mm 단위)
-Z_OFFSET = 350.0
-ORIGIN_OFFSET = -20.0
+Z_OFFSET = 270.0
+ORIGIN_OFFSET = -30.0
 SAVE_JSON = True
-OUTPUT_JSON_PATH = "/home/rokey/Downloads/CodeLLM/point/scan_result_base_coord.json"
+OUTPUT_JSON_PATH = os.path.join(BASE_DIR, "output", "scan_result_base_coord.json")
 
 class RealsenseDirect:
     def __init__(self):
@@ -85,22 +87,97 @@ class ObjectDetector:
     def __init__(self, cam_node):
         self.cam_node = cam_node
         self.intrinsics = self.cam_node.get_camera_intrinsic()
+    def find_grasp_point_by_contour(self, depth_frame, box):
+        try:
+            x1, y1, x2, y2 = map(int, box)
+            x1, x2 = max(0, x1), min(depth_frame.shape[1]-1, x2)
+            y1, y2 = max(0, y1), min(depth_frame.shape[0]-1, y2)
+            
+            roi_depth = depth_frame[y1:y2, x1:x2].astype(float)
+            valid_mask = roi_depth > 0
+            if not np.any(valid_mask):
+                return int((x1+x2)/2), int((y1+y2)/2)
+                
+            # 1. 0~9 단계 등고선 생성 (꼭대기=0)
+            z_max = np.percentile(roi_depth[valid_mask], 95)
+            z_min = np.percentile(roi_depth[valid_mask], 5)
+            levels = np.floor((roi_depth - z_min) / (z_max - z_min + 1e-6) * 10)
+            levels = np.clip(levels, 0, 9).astype(np.uint8)
+            
+            # 2. 가장 높은 지점(레벨 0) 영역 추출
+            top_mask = (levels == 0).astype(np.uint8)
+            
+            # 3. OpenCV의 moments를 이용해 무게중심(Centroid) 계산
+            M = cv2.moments(top_mask)
+            if M["m00"] != 0:
+                local_x = int(M["m10"] / M["m00"])
+                local_y = int(M["m01"] / M["m00"])
+            else:
+                # 레벨 0 영역이 너무 작거나 없을 경우 영역 전체의 무게중심으로 대체
+                M_all = cv2.moments(valid_mask.astype(np.uint8))
+                if M_all["m00"] != 0:
+                    local_x = int(M_all["m10"] / M_all["m00"])
+                    local_y = int(M_all["m01"] / M_all["m00"])
+                else:
+                    local_y, local_x = int(roi_depth.shape[0]/2), int(roi_depth.shape[1]/2)
 
-    def compute_positions(self, valid_detections):
+            # =======================================================
+            # 💡 [시각화] 무게중심 표시
+            # =======================================================
+            vis = cv2.applyColorMap((levels * 25).astype(np.uint8), cv2.COLORMAP_TURBO)
+            
+            # 각 레벨(0~9)의 무게중심에 숫자 텍스트 표시
+            for i in range(10):
+                level_mask = (levels == i).astype(np.uint8)
+                M = cv2.moments(level_mask)
+                if M["m00"] > 100: # 너무 작은 영역은 제외
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    # 흰색 텍스트로 레벨 숫자 표시
+                    cv2.putText(vis, str(i), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+            # 무게중심 마커 추가
+            cv2.drawMarker(vis, (local_x, local_y), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
+            
+            # 화면 확대 및 출력
+            cv2.imshow("Centroid & Level Analysis", cv2.resize(vis, None, fx=3.0, fy=3.0))
+            # =======================================================
+
+            return x1 + local_x, y1 + local_y
+            
+        except Exception as e:
+                print(f"⚠️ 무게중심 연산 에러: {e}")
+                return int((x1+x2)/2), int((y1+y2)/2)
+
+    # 💡 파라미터에 `annotated_frame` 추가
+    def compute_positions(self, valid_detections, annotated_frame=None):
         state_list = []
         depth_frame = self.cam_node.get_depth_frame()
         if depth_frame is None: return state_list
+        
         for target, box, conf in valid_detections:
-            cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
+            if target in ["colored", "white", "colored_towel", "white_towel"]:
+                cx, cy = self.find_grasp_point_by_contour(depth_frame, box)
+            else:
+                cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
+                
+            # 💡 [시각화] 메인 YOLO 화면에 핑크색 타겟 마킹 표시
+            if annotated_frame is not None:
+                cv2.drawMarker(annotated_frame, (cx, cy), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 3)
+                cv2.circle(annotated_frame, (cx, cy), 4, (0, 255, 255), -1)
+
             try:
                 cz = depth_frame[cy, cx]
                 if cz == 0: continue
             except IndexError: continue
+            
             x_3d = (cx - self.intrinsics["ppx"]) * cz / self.intrinsics["fx"]
             y_3d = (cy - self.intrinsics["ppy"]) * cz / self.intrinsics["fy"]
             state_list.append([target, [float(x_3d), float(y_3d), float(cz)]])
+            
         return state_list
-
+    
+    
 class IntegratedScanner:
     def __init__(self, node):
         self.node = node
@@ -172,55 +249,79 @@ class IntegratedScanner:
                 else:
                     target_id = target
                     
+
+                target_id_offset = "Offset 없음"
                 # 💡 1. 원본 좌표 추가
 
 
-                if final_centroid[0] < 500:
+                if target_id == "container1" or target_id == "container2":
                     
                     final_results[target_id] = {
                         "x": round(float(final_centroid[0]), 1), 
-                        "y": round(float(final_centroid[1]), 1), 
-                        "z": round(float(final_centroid[2]) + ORIGIN_OFFSET-10, 1),
-                        "rx": round(float(150.0), 1), 
-                        "ry": round(float(179.0), 1), 
-                        "rz": round(float(150.0), 1),
+                        "y": round(float(final_centroid[1]), 1) + (ORIGIN_OFFSET if float(final_centroid[1]) >= 0 else -ORIGIN_OFFSET+5),
+                        "z": round(float(final_centroid[2]) - ORIGIN_OFFSET*2, 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
                         "count": int(len(cluster)),
                     }
 
                     target_id_offset = f"{target_id}_offset"
                     final_results[target_id_offset] = {
                         "x": round(float(final_centroid[0]), 1), 
-                        "y": round(float(final_centroid[1]), 1), 
+                        "y": round(float(final_centroid[1]), 1) + (ORIGIN_OFFSET if float(final_centroid[1]) >= 0 else -ORIGIN_OFFSET),
                         "z": round(float(final_centroid[2]) + Z_OFFSET, 1),
-                        "rx": round(float(150.0), 1), 
-                        "ry": round(float(179.0), 1), 
-                        "rz": round(float(150.0), 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
                         "count": int(len(cluster)),
                     }
 
-                
+                elif target_id == "washing_machine" :
 
-                final_results[target_id] = {
-                    "x": round(float(final_centroid[0]), 1), 
-                    "y": round(float(final_centroid[1]), 1), 
-                    "z": round(float(final_centroid[2]) + ORIGIN_OFFSET, 1),
-                    "rx": round(float(current_posx[3]), 1), 
-                    "ry": round(float(current_posx[4]), 1), 
-                    "rz": round(float(current_posx[5]), 1),
-                    "count": int(len(cluster)),
-                }
+                    final_results[target_id] = {
+                        "x": round(float(final_centroid[0])+ ORIGIN_OFFSET, 1), 
+                        "y": round(float(final_centroid[1]), 1) + (ORIGIN_OFFSET-5 if float(final_centroid[1]) >= 0 else -ORIGIN_OFFSET+5),
+                        "z": round(float(final_centroid[2]) - ORIGIN_OFFSET*3, 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
+                        "count": int(len(cluster)),
+                    }
+                     
+                    target_id_offset = f"{target_id}_offset"
+                    final_results[target_id_offset] = {
+                        "x": round(float(final_centroid[0]), 1), 
+                        "y": round(float(final_centroid[1]), 1) + (ORIGIN_OFFSET if float(final_centroid[1]) >= 0 else -ORIGIN_OFFSET),
+                        "z": round(float(final_centroid[2]) + Z_OFFSET, 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
+                        "count": int(len(cluster)),
+                        }
+                     
+                else:
+                    final_results[target_id] = {
+                        "x": round(float(final_centroid[0]), 1), 
+                        "y": round(float(final_centroid[1]), 1), 
+                        "z": round(float(final_centroid[2])-50, 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
+                        "count": int(len(cluster)),
+                    }
 
-                # 💡 2. Z축 오프셋 좌표 추가 (소수점 1자리 반올림)
-                target_id_offset = f"{target_id}_offset"
-                final_results[target_id_offset] = {
-                    "x": round(float(final_centroid[0]), 1), 
-                    "y": round(float(final_centroid[1]), 1), 
-                    "z": round(float(final_centroid[2]) + Z_OFFSET, 1),
-                    "rx": round(float(current_posx[3]), 1), 
-                    "ry": round(float(current_posx[4]), 1), 
-                    "rz": round(float(current_posx[5]), 1),
-                    "count": int(len(cluster)),
-                }
+                    # 💡 2. Z축 오프셋 좌표 추가 (소수점 1자리 반올림)
+                    target_id_offset = f"{target_id}_offset"
+                    final_results[target_id_offset] = {
+                        "x": round(float(final_centroid[0]), 1), 
+                        "y": round(float(final_centroid[1]), 1), 
+                        "z": round(float(final_centroid[2]) + Z_OFFSET, 1),
+                        "rx": round(float(current_posx[3]), 1), 
+                        "ry": round(float(current_posx[4]), 1), 
+                        "rz": round(float(current_posx[5]), 1),
+                        "count": int(len(cluster)),
+                    }
                 
                 self.logger.info(f"🎯 객체 확정: [{target_id}] & [{target_id_offset}] 생성 (y좌표: {final_centroid[1]:.2f})")
                 
@@ -288,7 +389,7 @@ def run_scan_module():
                 continue
 
             valid_detections, annotated_frame = yolo.get_all_best_detections(cam)
-            coords = detector.compute_positions(valid_detections)
+            coords = detector.compute_positions(valid_detections, annotated_frame)
 
             for target, cam_coords in coords:
                 scanner.vision_buffer.append((target, cam_coords))

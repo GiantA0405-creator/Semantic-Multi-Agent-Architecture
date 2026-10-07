@@ -2,21 +2,6 @@ import sys
 import os
 import ctypes
 
-# =====================================================================
-# 🚨 1. libcublas.so.12 물리적 강제 로딩 (무조건 최상단 실행)
-# =====================================================================
-v_env = os.environ.get('VIRTUAL_ENV') or os.path.dirname(os.path.dirname(sys.executable))
-
-cublas_path = os.path.join(v_env, 'lib', 'python3.10', 'site-packages', 'nvidia', 'cublas', 'lib', 'libcublas.so.12')
-cudnn_path = os.path.join(v_env, 'lib', 'python3.10', 'site-packages', 'nvidia', 'cudnn', 'lib', 'libcudnn.so.9')
-
-try:
-    ctypes.CDLL(cublas_path)
-    ctypes.CDLL(cudnn_path)
-    print("✅ [Fix] CUDA 12 라이브러리 메모리 강제 로드 성공!")
-except Exception as e:
-    print(f"❌ [Fix] 라이브러리 로드 실패. 가상환경 경로를 다시 확인하세요: {e}")
-
 
 # =====================================================================
 # 🔇 2. ALSA/JACK 로그 영구 차단 (C-level 에러 핸들러 덮어쓰기)
@@ -175,12 +160,17 @@ class DualAgentControlCenter:
         
         [사용 가능한 사내 제작 모듈 (Bringup 리스트)]
         - [Bring-1] (YOLO_Vision): 카메라를 켜고 특정 객체의 실시간 좌표를 계속 추적함
-        
-        [🚨 핵심 기획 로직: 선행 조건(Prerequisite) 판단]
-        현재 주어진 YOLO 데이터에 사용자가 언급한 물체의 좌표가 없다면,
-        [Task] 작업을 지시하기 전에 반드시 [Bring-1] 작업을 1단계 스텝으로 먼저 기획해.
+        - [Bring-2] (Gesture_Controll_Module): 사용자의 제스처를 인식하고 로봇을 제어함(욜로에서 객체가 탐지되지 않을때 사용)
+    
+        [가장 중요한 핵심 기획 로직: 선행 조건 판단 및 연속 작업 절대 규칙]
+        1. 현재 주어진 YOLO 데이터에 사용자가 언급한 물체의 좌표가 없다면, [Task] 작업을 지시하기 전에 반드시 [Bring-1] 작업을 먼저 기획해.
+        2. 여러 물체를 조작하거나 연속적인 작업을 수행할 때, 절대 모든 [Bring-1]을 1, 2단계 초반에 몰아서 배치하지 마. (Batching 금지)
+        3. 모든 [Task]의 '바로 직전 스텝'에는 무조건 해당 타겟 물체를 스캔하는 [Bring-1]이 1:1로 짝지어져야 해. (예외 없음)
+        4. 물리적 상태 변화 인지: 로봇이 물체를 한 번 조작([Task])하고 나면 그 물체의 이전 좌표는 무효화된다. 따라서 같은 물체를 다른 곳으로 다시 옮겨야 할 경우, **반드시 [Bring-1]을 다시 기획하여 변동된 위치를 새롭게 스캔한 후 다음 [Task]를 수행해야 해.**
 
-        [🚨🚨 가장 중요한 규칙: 영어 강제 번역 (Language Rule)]
+        (올바른 다중/연속 작업 기획 흐름 예시: A 스캔 ➔ A 조작 ➔ B 스캔 ➔ B 조작 ➔ A 다시 스캔 ➔ A 2차 조작)
+
+        [가장 중요한 규칙: 영어 강제 번역 (Language Rule)]
         사용자가 한국어로 명령하더라도(예: "하얀 수건 세탁기에 넣어"), JSON 배열의 'target'과 'destination' 값은 **반드시 영어로 번역해서(예: "white_towel", "washing_machine") 적어야 해!**
         카메라(YOLO)가 객체를 영어로만 인식하기 때문에 한국어가 들어가면 매칭이 실패해.
         
@@ -373,7 +363,7 @@ class DualAgentControlCenter:
 
         start_background_server()
 
-        st.subheader("👁️ 감각 PC (1650) 데이터 수신부")
+        st.subheader(" YOLO 좌표 수신부")
         
         # 새로고침과 초기화 버튼
         col1, col2, col3 = st.columns([1, 1, 2])
@@ -424,7 +414,7 @@ class DualAgentControlCenter:
         default_yolo_str = json.dumps(current_yolo, indent=4, ensure_ascii=False) if current_yolo else "{}"
         
         yolo_input_str = st.text_area(
-            "📷 현재 카메라 인식 상태 (1650 PC 실시간 수신 데이터):", 
+            "📷 현재 카메라 인식 상태:", 
             value=default_yolo_str,
             height=200
         )
@@ -463,15 +453,48 @@ class DualAgentControlCenter:
                         
                         macro_output = macro_res['message']['content'].strip()
                         
-                        match = re.search(r'\[.*\]', macro_output, re.DOTALL)
-                        if not match:
-                            raise ValueError("AI 출력에서 JSON 배열을 찾을 수 없습니다.")
+                        def clean_and_parse(text):
+                            # LLM이 값을 큰따옴표 없이 "type": [Task] 로 출력하는 경우 자동 복구
+                            text = re.sub(r'"type"\s*:\s*\[([^\]]+)\]', r'"type": "[\1]"', text)
+                            # 후행 쉼표 에러 방지
+                            text = re.sub(r',\s*]', ']', text)
+                            text = re.sub(r',\s*}', '}', text)
+                            return json.loads(text)
+
+                        task_list = None
+                        
+                        # 전략 1: 마크다운 블록(```json ... ```) 우선 추출
+                        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', macro_output, re.DOTALL)
+                        if json_match:
+                            try:
+                                task_list = clean_and_parse(json_match.group(1))
+                            except Exception: pass
+
+                        # 전략 2: 괄호 쌍 맞추기 (가장 확실한 방법)
+                        if task_list is None:
+                            start_idx = macro_output.find('[')
+                            while start_idx != -1 and task_list is None:
+                                count = 0
+                                end_idx = -1
+                                for i in range(start_idx, len(macro_output)):
+                                    if macro_output[i] == '[':
+                                        count += 1
+                                    elif macro_output[i] == ']':
+                                        count -= 1
+                                        if count == 0:
+                                            end_idx = i
+                                            break
+                                if end_idx != -1:
+                                    candidate = macro_output[start_idx:end_idx+1]
+                                    try:
+                                        task_list = clean_and_parse(candidate)
+                                    except Exception:
+                                        pass
+                                start_idx = macro_output.find('[', start_idx + 1)
+                        
+                        if not task_list or not isinstance(task_list, list):
+                            raise ValueError("올바른 JSON 배열 형식을 찾거나 파싱하지 못했습니다.")
                             
-                        json_str = match.group(0)
-                        json_str = json_str.replace('"type": [Task]', '"type": "[Task]"')
-                        
-                        task_list = json.loads(json_str)
-                        
                         # 💡 기획된 리스트를 메모리에 저장하고 화면 새로고침
                         st.session_state['task_list'] = task_list
                         st.session_state['current_step_idx'] = 0
@@ -506,6 +529,17 @@ class DualAgentControlCenter:
                             # 4060에서 받은 데이터를 yolo 데이터로 갱신
                             st.session_state['yolo_data'] = result.get("data")
                             st.success("✅ 스캔 완료!")
+                            st.session_state['current_step_idx'] += 1
+                            st.rerun()
+
+                elif current_task.get('type') == "[Bring-2]":
+                    if st.button("🖐️ 제스처 제어 시작"):
+                        payload = {"action": "generate", "prompt": "[Bring-2]", "target": current_task.get('target')}
+                        result = self._send_to_4060(payload)
+                        if result and result.get("status") == "scan_result":
+                            # 4060에서 받은 데이터를 yolo 데이터로 갱신
+                            st.session_state['yolo_data'] = result.get("data")
+                            st.success("✅ 제스처 제어 완료!")
                             st.session_state['current_step_idx'] += 1
                             st.rerun()
 
